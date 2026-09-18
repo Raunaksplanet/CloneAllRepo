@@ -119,24 +119,60 @@ def http_get_json(url: str, headers: dict, params: dict, timeout: int = 20, retr
     sys.exit(f"[-] Network error after {retries} attempts: {last_err}")
 
 
+def get_authenticated_login(token: str, headers: dict) -> str:
+    """Resolve the username the token belongs to (GET /user)."""
+    status, resp_headers, data = http_get_json(f"{API_BASE}/user", headers, {})
+    if status == 401:
+        sys.exit("[-] 401 Unauthorized -- token is invalid, expired, or missing 'repo'/'read:user' scope.")
+    if status != 200 or not data or "login" not in data:
+        sys.exit(f"[-] Could not resolve authenticated user from token (status {status}).")
+    return data["login"]
+
+
 def fetch_repos(target: str, token: str | None, is_org: bool, include_forks: bool,
-                 include_archived: bool) -> list[dict]:
+                 include_archived: bool, include_private: bool) -> list[dict]:
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "clone_repos.py"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+
+    if include_private and not token:
+        sys.exit("[-] --private requires a token (--token or GITHUB_TOKEN). See README for how to create one.")
+
+    # /users/{username}/repos and /orgs/{org}/repos with type=all only ever return
+    # PUBLIC repos for a plain user target -- GitHub's public listing endpoint never
+    # includes private repos, token or not. Private repos of your own account are
+    # only visible via the authenticated /user/repos endpoint. Org private repos DO
+    # show up on /orgs/{org}/repos when the token has access, so that path is unchanged.
+    use_authed_user_endpoint = False
+    if include_private and not is_org:
+        me = get_authenticated_login(token, headers)
+        if me.lower() != target.lower():
+            sys.exit(
+                f"[-] --private only works for your own account (token belongs to '{me}') "
+                f"or an org you belong to. '{target}' is a different user -- the API has no "
+                f"way to list another user's private repos unless you use an org endpoint."
+            )
+        use_authed_user_endpoint = True
 
     kind = "orgs" if is_org else "users"
     repos: list[dict] = []
     page = 1
 
     while not _stop:
-        url = f"{API_BASE}/{kind}/{target}/repos"
-        params = {"per_page": 100, "page": page, "type": "all", "sort": "full_name"}
+        if use_authed_user_endpoint:
+            url = f"{API_BASE}/user/repos"
+            # type=owner: repos you own, public+private. (Deliberately not affiliation=owner,
+            # collaborator,organization_member -- that would also pull in repos you don't own,
+            # which "all his repos" doesn't mean here. Use --org for org repos instead.)
+            params = {"per_page": 100, "page": page, "type": "owner", "sort": "full_name"}
+        else:
+            url = f"{API_BASE}/{kind}/{target}/repos"
+            params = {"per_page": 100, "page": page, "type": "all", "sort": "full_name"}
         status, resp_headers, data = http_get_json(url, headers, params)
 
         if status == 404:
-            if not is_org:
-                return fetch_repos(target, token, True, include_forks, include_archived)
+            if not is_org and not use_authed_user_endpoint:
+                return fetch_repos(target, token, True, include_forks, include_archived, include_private)
             sys.exit(f"[-] '{target}' not found as user or org (404). Check spelling/case.")
 
         if status == 401:
@@ -263,6 +299,9 @@ def main():
     ap.add_argument("--org", action="store_true", help="Force treat target as an org")
     ap.add_argument("--include-forks", action="store_true", help="Include forked repos")
     ap.add_argument("--include-archived", action="store_true", help="Include archived repos")
+    ap.add_argument("--private", action="store_true",
+                     help="Include private repos too (requires --token; only works for your own "
+                          "account or an org you belong to -- see README)")
     ap.add_argument("--ssh", action="store_true", help="Clone via SSH instead of HTTPS")
     ap.add_argument("--workers", type=int, default=4, help="Parallel clone workers (default 4)")
     ap.add_argument("--out", default=None, help="Output directory (default: <target>-repos)")
@@ -297,7 +336,8 @@ def main():
                   f"Consider a shorter --out, or: git config --system core.longpaths true", file=sys.stderr)
 
     print(f"[*] Fetching repo list for '{user_or_org}'...")
-    repos = fetch_repos(user_or_org, args.token, args.org, args.include_forks, args.include_archived)
+    repos = fetch_repos(user_or_org, args.token, args.org, args.include_forks,
+                         args.include_archived, args.private)
 
     if not repos:
         sys.exit("[-] No repos found (empty account, all filtered out, or private-only with no token).")
